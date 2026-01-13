@@ -1,4 +1,3 @@
-# routers/user.py
 import asyncio
 import random
 import time
@@ -32,6 +31,13 @@ from database import (
     get_top_dogs, get_top_owners,
 
     race_join, race_participants, race_clear,
+
+    # tame/release
+    can_tame_owner, set_tame_owner,
+    can_retame, tame_dog, release_dog,
+
+    # discord role
+    set_sign,
 )
 
 from levels import get_level
@@ -43,10 +49,11 @@ PENDING_TTL = 120
 
 CASINO_ODDS = {2: 0.45, 3: 0.20, 4: 0.10, 5: 0.05}
 
+# ✅ магазин: стать хозяйкой + одно кастомное имя + роль дискорд
 SHOP = {
-    "be_girl": ("👑 Стать хозяйкой", 100, "auto_girl"),
-    "custom_dog_name": ("🐶 Имя пса", 100, "text_dog"),
-    "custom_owner_name": ("👑 Имя хозяйки", 100, "text_owner"),
+    "be_girl": ("👑 Стать хозяйкой", 250, "auto_girl"),
+    "custom_name": ("✏️ Кастомное имя", 100, "text_name"),
+    "custom_discord_role": ("🎭 Кастомная роль Discord", 500, "text_role"),
 }
 
 
@@ -55,14 +62,12 @@ SHOP = {
 def cb_pack(uid: int, action: str, extra: str | None = None) -> str:
     return f"{uid}:{action}" if extra is None else f"{uid}:{action}:{extra}"
 
-
 def cb_unpack(data: str):
     parts = data.split(":")
     uid = int(parts[0])
     action = parts[1] if len(parts) > 1 else ""
     extra = parts[2] if len(parts) > 2 else None
     return uid, action, extra
-
 
 async def auto_hide_kb(message: Message):
     await asyncio.sleep(MENU_LIFETIME)
@@ -71,15 +76,12 @@ async def auto_hide_kb(message: Message):
     except Exception:
         pass
 
-
 def skill_points_available(level: int, speed: int, fangs: int, bite: int) -> int:
     return max(0, (level - 1) - (speed + fangs + bite))
-
 
 def bar(v: int, mx: int = STAT_MAX, filled: str = "■", empty: str = "□") -> str:
     v = max(0, min(mx, int(v)))
     return filled * v + empty * (mx - v)
-
 
 def fmt_time_left(sec: int) -> str:
     sec = max(0, int(sec))
@@ -92,7 +94,6 @@ def fmt_time_left(sec: int) -> str:
         return f"{m}м {s}с"
     return f"{s}с"
 
-
 async def safe_edit(call: CallbackQuery, text: str, reply_markup=None):
     try:
         if getattr(call.message, "photo", None):
@@ -104,6 +105,72 @@ async def safe_edit(call: CallbackQuery, text: str, reply_markup=None):
             await call.message.edit_text(text, reply_markup=reply_markup, parse_mode="HTML")
         except Exception:
             pass
+
+def get_dog_display(dog_id: int) -> str:
+    dog = get_user(dog_id)
+    if not dog:
+        return "пёс"
+    dog_tg = dog[1]
+    dog_custom = (dog[11] or "").strip()
+    return dog_custom or f"{dog_tg} пёс"
+
+def owner_has_tamed_dog(owner_id: int):
+    """
+    Возвращает (dog_id, dog_row) если у хозяйки есть пес И он приручен к ней.
+    users columns:
+      0 user_id
+      1 name
+      2 xp
+      3 bones
+      4 owner_id
+      5 dog_id
+      6 gender
+      7 sign
+      8 last_food
+      9 owner_title
+      10 photo_id
+      11 dog_title
+      12 is_tamed
+      13 last_owner_id
+      14 last_escape_ts
+    """
+    owner = get_user(owner_id)
+    if not owner:
+        return None, None
+    dog_id = owner[5]
+    if not dog_id:
+        return None, None
+    dog = get_user(dog_id)
+    if not dog:
+        return None, None
+    is_tamed = int(dog[12] or 0)
+    if is_tamed != 1:
+        return None, None
+    if int(dog[4] or 0) != owner_id:
+        return None, None
+    return int(dog_id), dog
+
+def get_effective_stats_for_games(uid: int):
+    """
+    Для игр:
+    - если пёс -> его статы
+    - если хозяйка -> статы её прирученного пса (иначе None)
+    """
+    if not is_girl(uid):
+        return get_stats(uid)
+
+    dog_id, _dog = owner_has_tamed_dog(uid)
+    if not dog_id:
+        return None
+    return get_stats(dog_id)
+
+def fight_power_from_stats(fangs: int, bite: int) -> float:
+    """
+    "Рулетка": шанс победы зависит от клыков и укуса.
+    """
+    f = max(0, int(fangs))
+    b = max(0, int(bite))
+    return 1.0 + (f * 0.75) + (b * 0.65)
 
 
 # ===================== KEYBOARDS =====================
@@ -130,7 +197,6 @@ def kb_main(uid: int, user):
     kb.adjust(2, 2, 2, 2, 1)
     return kb.as_markup()
 
-
 def kb_profile_menu(uid: int):
     kb = InlineKeyboardBuilder()
     kb.button(text="📋 Показать", callback_data=cb_pack(uid, "profile_show"))
@@ -140,15 +206,15 @@ def kb_profile_menu(uid: int):
     kb.adjust(2, 1, 1)
     return kb.as_markup()
 
-
 def kb_owner_menu(uid: int):
     kb = InlineKeyboardBuilder()
+    kb.button(text="🪢 Приручить пса", callback_data=cb_pack(uid, "owner_tame"))
+    kb.button(text="🔓 Отпустить пса", callback_data=cb_pack(uid, "owner_release"))
     kb.button(text="🍖 Покормить (+5 XP псу +1 🦴)", callback_data=cb_pack(uid, "owner_feed"))
     kb.button(text="❤️ Приласкать (+10 XP псу)", callback_data=cb_pack(uid, "owner_pet"))
     kb.button(text="⬅ Вернуться в меню", callback_data=cb_pack(uid, "back_main"))
-    kb.adjust(1, 1, 1)
+    kb.adjust(1, 1, 1, 1, 1)
     return kb.as_markup()
-
 
 def kb_dog_menu(uid: int):
     kb = InlineKeyboardBuilder()
@@ -158,16 +224,14 @@ def kb_dog_menu(uid: int):
     kb.adjust(1, 1, 1)
     return kb.as_markup()
 
-
 def kb_games_menu(uid: int):
     kb = InlineKeyboardBuilder()
     kb.button(text="🏁 Гонки (лобби 30 мин)", callback_data=cb_pack(uid, "race"))
-    kb.button(text="⚔️ Битва на клыках", callback_data=cb_pack(uid, "fight"))
+    kb.button(text="🎲 Битва на клыках (рулетка)", callback_data=cb_pack(uid, "fight"))
     kb.button(text="🎰 Казино", callback_data=cb_pack(uid, "casino"))
     kb.button(text="⬅ Вернуться в меню", callback_data=cb_pack(uid, "back_main"))
     kb.adjust(1, 1, 1, 1)
     return kb.as_markup()
-
 
 def kb_top_menu(uid: int):
     kb = InlineKeyboardBuilder()
@@ -177,7 +241,6 @@ def kb_top_menu(uid: int):
     kb.adjust(1, 1, 1)
     return kb.as_markup()
 
-
 def kb_snot_menu(uid: int):
     kb = InlineKeyboardBuilder()
     kb.button(text="🤧 Поставить", callback_data=cb_pack(uid, "snot_set"))
@@ -185,7 +248,6 @@ def kb_snot_menu(uid: int):
     kb.button(text="⬅ Вернуться в меню", callback_data=cb_pack(uid, "back_main"))
     kb.adjust(1, 1, 1)
     return kb.as_markup()
-
 
 def kb_skills(uid: int):
     kb = InlineKeyboardBuilder()
@@ -196,17 +258,15 @@ def kb_skills(uid: int):
     kb.adjust(1, 1, 1, 1)
     return kb.as_markup()
 
-
 def kb_shop(uid: int):
     kb = InlineKeyboardBuilder()
     kb.button(text="🦴 Баланс", callback_data=cb_pack(uid, "bal"))
-    kb.button(text="👑 Стать хозяйкой — 100 🦴", callback_data=cb_pack(uid, "buy", "be_girl"))
-    kb.button(text="🐶 Имя пса — 100 🦴", callback_data=cb_pack(uid, "buy", "custom_dog_name"))
-    kb.button(text="👑 Имя хозяйки — 100 🦴", callback_data=cb_pack(uid, "buy", "custom_owner_name"))
+    kb.button(text="👑 Стать хозяйкой — 250 🦴", callback_data=cb_pack(uid, "buy", "be_girl"))
+    kb.button(text="✏️ Кастомное имя — 100 🦴", callback_data=cb_pack(uid, "buy", "custom_name"))
+    kb.button(text="🎭 Роль Discord — 500 🦴", callback_data=cb_pack(uid, "buy", "custom_discord_role"))
     kb.button(text="⬅ Вернуться в меню", callback_data=cb_pack(uid, "back_main"))
     kb.adjust(1, 1, 1, 1, 1)
     return kb.as_markup()
-
 
 def kb_casino_choose_x(uid: int):
     kb = InlineKeyboardBuilder()
@@ -218,7 +278,6 @@ def kb_casino_choose_x(uid: int):
     kb.adjust(2, 2, 1)
     return kb.as_markup()
 
-
 def kb_casino_bets(uid: int, mult: int):
     kb = InlineKeyboardBuilder()
     for b in (1, 5, 10, 25, 50, 100):
@@ -226,7 +285,6 @@ def kb_casino_bets(uid: int, mult: int):
     kb.button(text="⬅ Назад", callback_data=cb_pack(uid, "casino"))
     kb.adjust(2, 2, 2, 1)
     return kb.as_markup()
-
 
 def kb_fight_request(fight_id: int, target_id: int):
     kb = InlineKeyboardBuilder()
@@ -243,23 +301,30 @@ def build_profile_text(uid: int) -> str:
     if not user:
         return "❌ Профиль не найден"
 
-    tg_name = user[1]  # имя человека из Telegram
+    tg_name = user[1]
     xp = int(user[2] or 0)
     bones = int(user[3] or 0)
     owner_id = user[4]
     dog_id = user[5]
 
+    discord_role = (user[7] or "").strip()
     owner_title = (user[9] or "").strip() or "Хозяйка"
     photo_id = user[10] or ""
-    dog_title = (user[11] or "").strip()  # ✅ отдельное имя пса
+    dog_title = (user[11] or "").strip()
 
     photo_ok = "✅" if photo_id else "❌"
 
     spd, fng, bit = get_stats(uid)
+
+    # если хозяйка и пес приручен — показываем статы пса
+    if is_girl(uid) and dog_id:
+        dog = get_user(dog_id)
+        if dog and int(dog[12] or 0) == 1 and int(dog[4] or 0) == uid:
+            spd, fng, bit = get_stats(dog_id)
+
     lvl = int(get_level(xp))
     points = skill_points_available(lvl, spd, fng, bit)
 
-    # как показывать имя пса
     dog_display = dog_title or f"{tg_name} пёс"
 
     extra = ""
@@ -269,9 +334,9 @@ def build_profile_text(uid: int) -> str:
         if dog_id:
             dog = get_user(dog_id)
             if dog:
-                dog_tg = dog[1]
-                dog_custom = (dog[11] or "").strip()
-                extra = f"🐶 <b>Пёс:</b> {dog_custom or f'{dog_tg} пёс'}"
+                dog_name = get_dog_display(dog_id)
+                tamed = "✅" if (int(dog[12] or 0) == 1 and int(dog[4] or 0) == uid) else "❌"
+                extra = f"🐶 <b>Пёс:</b> {dog_name} | 🪢 {tamed}"
             else:
                 extra = "🐶 <b>Пёс:</b> нет"
         else:
@@ -288,6 +353,8 @@ def build_profile_text(uid: int) -> str:
         header = f"🐕 <b>{dog_display}</b>"
         role_line = "🏷 <b>Роль:</b> бродячий"
 
+    role_line2 = f"🎭 <b>Discord роль:</b> {discord_role}" if discord_role else ""
+
     stat_block = (
         f"🧠 <b>Skill Points:</b> {points}\n\n"
         f"⚡ <b>Скорость</b> {spd}/{STAT_MAX}\n<code>{bar(spd)}</code>\n"
@@ -300,6 +367,8 @@ def build_profile_text(uid: int) -> str:
         header,
         role_line,
     ]
+    if role_line2:
+        lines.append(role_line2)
     if extra:
         lines.append(extra)
 
@@ -313,7 +382,6 @@ def build_profile_text(uid: int) -> str:
         stat_block,
     ]
     return "\n".join(lines).strip()
-
 
 async def edit_profile_menu(bot, chat_id: int, message_id: int, uid: int):
     user = get_user(uid)
@@ -360,11 +428,9 @@ async def send_menu(message: Message):
     )
     asyncio.create_task(auto_hide_kb(msg))
 
-
 @router.message(CommandStart())
 async def start(message: Message):
     await send_menu(message)
-
 
 @router.message(Command("menu"))
 async def menu(message: Message):
@@ -495,41 +561,46 @@ async def callbacks(call: CallbackQuery):
             await call.answer("🦴 Не хватает костей.", show_alert=True)
             return
 
+        spend_bones(uid, price)
+
         if mode == "auto_girl":
             if is_girl(uid):
                 await call.answer("Ты уже хозяйка.", show_alert=True)
                 return
-            spend_bones(uid, price)
             set_girl(uid)
             await safe_edit(call, f"✅ Куплено: <b>{title}</b>\n👑 Теперь ты хозяйка!", kb_shop(uid))
             await call.answer()
             return
 
-        spend_bones(uid, price)
         meta = f"{call.message.chat.id}:{call.message.message_id}"
 
-        if mode == "text_dog":
+        if mode == "text_name":
+            set_pending(uid, "shop_custom_name", meta)
             if is_girl(uid):
-                await call.answer("Имя пса покупает пёс (не хозяйка).", show_alert=True)
-                return
-            set_pending(uid, "shop_dog_name", meta)
-            await safe_edit(call,
-                            "🐶 <b>Имя пса</b>\n"
-                            "Отправь <b>одно слово</b> (до 15 символов).\n"
-                            "Имя станет: <b>слово пёс</b>.\n"
-                            f"⏳ {PENDING_TTL} сек.",
-                            kb_shop(uid))
+                await safe_edit(
+                    call,
+                    "👑 <b>Кастомное имя</b>\n"
+                    "Отправь имя хозяйки (до 30 символов).\n"
+                    f"⏳ {PENDING_TTL} сек.",
+                    kb_shop(uid),
+                )
+            else:
+                await safe_edit(
+                    call,
+                    "🐶 <b>Кастомное имя</b>\n"
+                    "Отправь <b>одно слово</b> (до 15 символов).\n"
+                    "Имя станет: <b>слово пёс</b>.\n"
+                    f"⏳ {PENDING_TTL} сек.",
+                    kb_shop(uid),
+                )
             await call.answer()
             return
 
-        if mode == "text_owner":
-            if not is_girl(uid):
-                await call.answer("Имя хозяйки покупает только хозяйка.", show_alert=True)
-                return
-            set_pending(uid, "shop_owner_name", meta)
+        if mode == "text_role":
+            set_pending(uid, "shop_discord_role", meta)
             await safe_edit(call,
-                            "👑 <b>Имя хозяйки</b>\n"
-                            "Отправь имя (до 30 символов).\n"
+                            "🎭 <b>Кастомная роль Discord</b>\n"
+                            "Отправь текст роли (до 50 символов).\n"
                             f"⏳ {PENDING_TTL} сек.",
                             kb_shop(uid))
             await call.answer()
@@ -540,7 +611,39 @@ async def callbacks(call: CallbackQuery):
 
     # ===================== OWNER =====================
 
-    if action == "owner_feed":
+    if action == "owner_tame":
+        if not call.message.chat or call.message.chat.type == "private":
+            await call.answer("Приручение — только в чате. Открой меню в группе.", show_alert=True)
+            return
+
+        if not is_girl(uid):
+            await call.answer("Только хозяйка.", show_alert=True)
+            return
+
+        if user[5]:
+            await safe_edit(call, "👑 <b>Хозяйка</b>\n🐶 У тебя уже есть пёс. Сначала отпусти его 🔓", kb_owner_menu(uid))
+            await call.answer()
+            return
+
+        ok_cd, rem_cd = can_tame_owner(uid)
+        if not ok_cd:
+            await safe_edit(call, f"👑 <b>Хозяйка</b>\n⏳ Приручить можно через <b>{fmt_time_left(rem_cd)}</b>", kb_owner_menu(uid))
+            await call.answer()
+            return
+
+        set_pending(uid, "tame_pick", f"{call.message.chat.id}")
+        await safe_edit(
+            call,
+            "👑 <b>Приручение</b>\n"
+            "Ответь на сообщение <b>незанятого пса</b> любым текстом.\n"
+            f"⏳ Время: {PENDING_TTL} сек.\n"
+            "⚠️ Можно приручать <b>раз в сутки</b>.",
+            kb_owner_menu(uid),
+        )
+        await call.answer()
+        return
+
+    if action == "owner_release":
         if not is_girl(uid):
             await call.answer("Только хозяйка.", show_alert=True)
             return
@@ -548,7 +651,23 @@ async def callbacks(call: CallbackQuery):
             await safe_edit(call, "👑 <b>Хозяйка</b>\n🐶 У тебя нет пса.", kb_owner_menu(uid))
             await call.answer()
             return
-        dog_id = user[5]
+        ok = release_dog(uid)
+        if not ok:
+            await call.answer("Ошибка отпуска.", show_alert=True)
+            return
+        await safe_edit(call, "👑 <b>Хозяйка</b>\n🔓 Ты отпустила пса. Теперь он бродячий 🐕", kb_owner_menu(uid))
+        await call.answer()
+        return
+
+    if action == "owner_feed":
+        if not is_girl(uid):
+            await call.answer("Только хозяйка.", show_alert=True)
+            return
+        dog_id, _dog = owner_has_tamed_dog(uid)
+        if not dog_id:
+            await safe_edit(call, "👑 <b>Хозяйка</b>\n🐶 Нет прирученного пса.", kb_owner_menu(uid))
+            await call.answer()
+            return
         add_xp(dog_id, 5)
         add_bones(dog_id, 1)
         await safe_edit(call, "👑 <b>Хозяйка</b>\n🍖 Ты покормила пса!\n🐶 +<b>5 XP</b> и +<b>1 🦴</b>", kb_owner_menu(uid))
@@ -559,11 +678,11 @@ async def callbacks(call: CallbackQuery):
         if not is_girl(uid):
             await call.answer("Только хозяйка.", show_alert=True)
             return
-        if not user[5]:
-            await safe_edit(call, "👑 <b>Хозяйка</b>\n🐶 У тебя нет пса.", kb_owner_menu(uid))
+        dog_id, _dog = owner_has_tamed_dog(uid)
+        if not dog_id:
+            await safe_edit(call, "👑 <b>Хозяйка</b>\n🐶 Нет прирученного пса.", kb_owner_menu(uid))
             await call.answer()
             return
-        dog_id = user[5]
         add_xp(dog_id, 10)
         await safe_edit(call, "👑 <b>Хозяйка</b>\n❤️ Ты приласкала пса!\n🐶 +<b>10 XP</b>", kb_owner_menu(uid))
         await call.answer()
@@ -622,14 +741,16 @@ async def callbacks(call: CallbackQuery):
         await call.answer()
         return
 
-    # ===================== GAMES / TOP / SNOT / CASINO / FIGHT / RACE =====================
+    # ===================== GAMES =====================
 
     if action == "race":
         if not call.message.chat or call.message.chat.type == "private":
             await call.answer("Только в чате.", show_alert=True)
             return
-        if is_girl(uid):
-            await call.answer("В гонках участвуют псы.", show_alert=True)
+
+        eff = get_effective_stats_for_games(uid)
+        if eff is None:
+            await call.answer("Чтобы участвовать, хозяйке нужен прирученный пёс 🪢", show_alert=True)
             return
 
         ok_cd, rem_cd = can_race(uid)
@@ -638,8 +759,15 @@ async def callbacks(call: CallbackQuery):
             return
 
         chat_id = call.message.chat.id
-        spd, _f, _b = get_stats(uid)
-        _start_ts, end_ts = race_join(chat_id, uid, name, spd)
+        spd, _f, _b = eff
+
+        if is_girl(uid):
+            dog_id, _ = owner_has_tamed_dog(uid)
+            part_name = get_dog_display(dog_id) if dog_id else name
+        else:
+            part_name = name
+
+        _start_ts, end_ts = race_join(chat_id, uid, part_name, spd)
         parts = race_participants(chat_id)
 
         now = int(time.time())
@@ -683,7 +811,7 @@ async def callbacks(call: CallbackQuery):
             for (pu, _pn, _ps, _ts) in parts:
                 set_race(pu)
 
-            text = "🏁 <b>ГОНКИ ПСОВ</b>\n\n"
+            text = "🏁 <b>ГОНКИ</b>\n\n"
             text += "📊 <b>Шансы участников:</b>\n"
             for (_pu, pn, ps, ch, _w2) in sorted(chances, key=lambda x: x[3], reverse=True):
                 text += f"• <b>{pn}</b> (⚡{ps}) — <b>{ch:.1f}%</b>\n"
@@ -696,14 +824,14 @@ async def callbacks(call: CallbackQuery):
             return
 
         chances, _ = _race_chances(parts)
-        text = "🏁 <b>Гонки псов (лобби)</b>\n\n"
+        text = "🏁 <b>Гонки (лобби)</b>\n\n"
         text += f"⏳ До старта: <b>{fmt_time_left(left)}</b>\n"
         text += f"👥 Участников: <b>{len(parts)}</b>/3+\n\n"
         text += "📊 <b>Текущие шансы:</b>\n"
         for (_pu, pn, ps, ch, _w2) in sorted(chances, key=lambda x: x[3], reverse=True):
             text += f"• <b>{pn}</b> (⚡{ps}) — <b>{ch:.1f}%</b>\n"
         if len(parts) < 3:
-            text += "\n❗ Нужно минимум <b>3</b> собаки. Пусть ещё нажмут кнопку."
+            text += "\n❗ Нужно минимум <b>3</b> игрока."
 
         await safe_edit(call, text, kb_games_menu(uid))
         await call.answer()
@@ -713,17 +841,20 @@ async def callbacks(call: CallbackQuery):
         if not call.message.chat or call.message.chat.type == "private":
             await call.answer("Только в чате.", show_alert=True)
             return
-        if is_girl(uid):
-            await call.answer("Это для пса.", show_alert=True)
+
+        eff = get_effective_stats_for_games(uid)
+        if eff is None:
+            await call.answer("Чтобы играть, хозяйке нужен прирученный пёс 🪢", show_alert=True)
             return
 
         meta = f"{call.message.chat.id}:{call.message.message_id}"
         set_pending(uid, "fight_pick", meta)
         await safe_edit(
             call,
-            "⚔️ <b>Битва на клыках</b>\n"
+            "🎲 <b>Битва на клыках (рулетка)</b>\n"
             "Ответь на сообщение соперника числом <b>ставки</b> (костей).\n"
             "Пример: <b>10</b>\n"
+            "⚠️ Второй должен <b>подтвердить</b> участие.\n"
             f"⏳ Время: {PENDING_TTL} сек.",
             kb_games_menu(uid),
         )
@@ -874,24 +1005,33 @@ async def fight_callbacks(call: CallbackQuery):
 
     if action == "decline":
         set_fight_status(fight_id, "declined")
-        await call.message.answer(f"❌ {target_name} отказался от битвы.")
+        await call.message.answer(f"❌ {target_name} отказался от поединка.")
         await call.answer()
         return
 
     if get_bones(challenger_id) < stake or get_bones(target_id) < stake:
         set_fight_status(fight_id, "cancelled")
-        await call.message.answer("⚠️ У одного из участников нет костей. Битва отменена.")
+        await call.message.answer("⚠️ У одного из участников нет костей. Поединок отменён.")
         await call.answer()
         return
 
     spend_bones(challenger_id, stake)
     spend_bones(target_id, stake)
 
-    c_spd, c_fng, c_bit = get_stats(challenger_id)
-    t_spd, t_fng, t_bit = get_stats(target_id)
+    c_eff = get_effective_stats_for_games(challenger_id)
+    t_eff = get_effective_stats_for_games(target_id)
+    if c_eff is None or t_eff is None:
+        set_fight_status(fight_id, "cancelled")
+        await call.message.answer("⚠️ У одного из участников нет прирученного пса. Поединок отменён.")
+        await call.answer()
+        return
 
-    c_power = (c_fng * 0.55) + (c_bit * 0.45) + 1.0
-    t_power = (t_fng * 0.55) + (t_bit * 0.45) + 1.0
+    _c_spd, c_fng, c_bit = c_eff
+    _t_spd, t_fng, t_bit = t_eff
+
+    c_power = fight_power_from_stats(c_fng, c_bit)
+    t_power = fight_power_from_stats(t_fng, t_bit)
+
     win_prob = c_power / (c_power + t_power)
 
     if random.random() < win_prob:
@@ -912,8 +1052,10 @@ async def fight_callbacks(call: CallbackQuery):
     set_fight_status(fight_id, "done")
 
     await call.message.answer(
-        "⚔️ <b>БИТВА НА КЛЫКАХ!</b>\n"
+        "🎲 <b>БИТВА НА КЛЫКАХ (РУЛЕТКА)!</b>\n"
         f"🦴 Ставка: <b>{stake}</b>\n\n"
+        f"📈 Шанс {challenger_name}: <b>{win_prob*100:.1f}%</b>\n"
+        f"📉 Шанс {target_name}: <b>{(1-win_prob)*100:.1f}%</b>\n\n"
         f"🏆 Победил: <b>{winner_name}</b>\n"
         f"💀 Проиграл: <b>{loser_name}</b>\n"
         f"🦴 Приз: <b>{prize}</b>",
@@ -959,11 +1101,17 @@ async def messages(message: Message):
                             pass
                     return
 
-                if action == "shop_owner_name":
+                if action == "shop_custom_name":
                     text = (message.text or "").strip()
                     if not text:
                         return
-                    set_owner_title(uid, text[:30])
+
+                    if is_girl(uid):
+                        set_owner_title(uid, text[:30])
+                    else:
+                        word = text.split()[0][:15]
+                        set_dog_title(uid, f"{word} пёс")
+
                     clear_pending(uid)
                     try:
                         await message.delete()
@@ -976,12 +1124,11 @@ async def messages(message: Message):
                             pass
                     return
 
-                if action == "shop_dog_name":
+                if action == "shop_discord_role":
                     text = (message.text or "").strip()
                     if not text:
                         return
-                    word = text.split()[0][:15]
-                    set_dog_title(uid, f"{word} пёс")
+                    set_sign(uid, text[:50])
                     clear_pending(uid)
                     try:
                         await message.delete()
@@ -992,6 +1139,85 @@ async def messages(message: Message):
                             await edit_profile_menu(message.bot, menu_chat_id, menu_msg_id, uid)
                         except Exception:
                             pass
+                    return
+
+                if action == "tame_pick":
+                    if not message.chat or message.chat.type == "private":
+                        return
+                    if not is_girl(uid):
+                        clear_pending(uid)
+                        return
+                    if not message.reply_to_message or not message.reply_to_message.from_user:
+                        return
+
+                    chat_id_needed = int(meta) if meta and meta.isdigit() else None
+                    if chat_id_needed and message.chat.id != chat_id_needed:
+                        return
+
+                    ok_cd, _rem_cd = can_tame_owner(uid)
+                    if not ok_cd:
+                        clear_pending(uid)
+                        try:
+                            await message.delete()
+                        except Exception:
+                            pass
+                        return
+
+                    me = get_user(uid)
+                    if me and me[5]:
+                        clear_pending(uid)
+                        try:
+                            await message.delete()
+                        except Exception:
+                            pass
+                        return
+
+                    target = message.reply_to_message.from_user
+                    dog_id = target.id
+                    dog = get_user(dog_id)
+                    if not dog:
+                        clear_pending(uid)
+                        try:
+                            await message.delete()
+                        except Exception:
+                            pass
+                        return
+
+                    if is_girl(dog_id):
+                        clear_pending(uid)
+                        try:
+                            await message.delete()
+                        except Exception:
+                            pass
+                        return
+
+                    # пёс должен быть свободен
+                    if dog[4] is not None:
+                        clear_pending(uid)
+                        try:
+                            await message.delete()
+                        except Exception:
+                            pass
+                        return
+
+                    ok_ret, _rem_ret = can_retame(uid, dog_id)
+                    if not ok_ret:
+                        clear_pending(uid)
+                        try:
+                            await message.delete()
+                        except Exception:
+                            pass
+                        return
+
+                    ok = tame_dog(uid, dog_id)
+                    if ok:
+                        set_tame_owner(uid)
+
+                    clear_pending(uid)
+                    try:
+                        await message.delete()
+                    except Exception:
+                        pass
                     return
 
                 if action == "snot_pick":
@@ -1042,7 +1268,20 @@ async def messages(message: Message):
                     en = get_user(enemy.id)
                     if not me or not en:
                         return
-                    if is_girl(uid) or is_girl(enemy.id):
+
+                    if get_effective_stats_for_games(uid) is None:
+                        clear_pending(uid)
+                        try:
+                            await message.delete()
+                        except Exception:
+                            pass
+                        return
+                    if get_effective_stats_for_games(enemy.id) is None:
+                        clear_pending(uid)
+                        try:
+                            await message.delete()
+                        except Exception:
+                            pass
                         return
 
                     if get_bones(uid) < stake or get_bones(enemy.id) < stake:
@@ -1062,10 +1301,9 @@ async def messages(message: Message):
                         pass
 
                     await message.answer(
-                        "⚔️ <b>Вызов на битву!</b>\n"
-                        f"🐶 {me[1]} вызывает {enemy.first_name}\n"
+                        "🎲 <b>Вызов на битву на клыках!</b>\n"
                         f"🦴 Ставка: <b>{stake}</b>\n\n"
-                        f"{enemy.first_name}, принимай или отказывайся:",
+                        f"{enemy.first_name}, подтверждай участие:",
                         reply_markup=kb_fight_request(fight_id, enemy.id),
                         parse_mode="HTML"
                     )
