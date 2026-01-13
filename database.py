@@ -21,6 +21,8 @@ SNOT_DURATION = 30 * 60       # 30 минут
 TAME_COOLDOWN = 24 * 60 * 60     # хозяйка может приручать раз в сутки
 RETAME_COOLDOWN = 24 * 60 * 60   # бывшая хозяйка может вернуть сбежавшего пса через сутки
 
+MSG_XP_CD = 2  # ✅ XP за сообщение раз в 2 секунды
+
 PENDING_DEFAULT_TTL = 120     # 2 минуты
 
 
@@ -45,9 +47,9 @@ def init_db():
         photo_id    TEXT,          -- file_id телеги
         dog_title   TEXT,          -- кастомное имя пса
 
-        is_tamed      INTEGER DEFAULT 0,  -- 1 если приручен
-        last_owner_id INTEGER,            -- последняя хозяйка
-        last_escape_ts INTEGER            -- время последнего побега
+        is_tamed        INTEGER DEFAULT 0,  -- 1 если приручен
+        last_owner_id   INTEGER,            -- последняя хозяйка
+        last_escape_ts  INTEGER             -- время последнего побега
     )
     """)
     conn.commit()
@@ -70,7 +72,8 @@ def init_db():
         last_walk   INTEGER DEFAULT 0,
         last_escape INTEGER DEFAULT 0,
         last_snot   INTEGER DEFAULT 0,
-        last_tame   INTEGER DEFAULT 0
+        last_tame   INTEGER DEFAULT 0,
+        last_msg_xp INTEGER DEFAULT 0
     )
     """)
     conn.commit()
@@ -169,6 +172,8 @@ def init_db():
         add_col("ALTER TABLE user_cooldowns ADD COLUMN last_snot INTEGER DEFAULT 0")
     if "last_tame" not in cols_cd:
         add_col("ALTER TABLE user_cooldowns ADD COLUMN last_tame INTEGER DEFAULT 0")
+    if "last_msg_xp" not in cols_cd:
+        add_col("ALTER TABLE user_cooldowns ADD COLUMN last_msg_xp INTEGER DEFAULT 0")
 
 init_db()
 
@@ -179,7 +184,6 @@ def get_or_create(user_id: int, name: str):
     cursor.execute("INSERT OR IGNORE INTO users(user_id, name) VALUES(?,?)", (user_id, name))
     conn.commit()
 
-    # всегда актуализируем имя из Telegram
     cursor.execute("UPDATE users SET name=? WHERE user_id=?", (name, user_id))
     conn.commit()
 
@@ -265,7 +269,7 @@ def add_stat_point(user_id: int, stat: str) -> bool:
 
 def _get_cd(user_id: int):
     cursor.execute("""
-        SELECT last_menu, last_race, last_walk, last_escape, last_snot, last_tame
+        SELECT last_menu, last_race, last_walk, last_escape, last_snot, last_tame, last_msg_xp
         FROM user_cooldowns
         WHERE user_id=?
     """, (user_id,))
@@ -273,7 +277,7 @@ def _get_cd(user_id: int):
     if not row:
         cursor.execute("INSERT OR IGNORE INTO user_cooldowns(user_id) VALUES(?)", (user_id,))
         conn.commit()
-        return (0, 0, 0, 0, 0, 0)
+        return (0, 0, 0, 0, 0, 0, 0)
     return tuple(int(x or 0) for x in row)
 
 def can_open_menu(user_id: int) -> Tuple[bool, int]:
@@ -326,7 +330,7 @@ def set_escape(user_id: int):
 
 def can_tame_owner(owner_id: int) -> Tuple[bool, int]:
     now = int(time.time())
-    *_, last_tame = _get_cd(owner_id)
+    *_, last_tame, _last_msg_xp = _get_cd(owner_id)
     if now - last_tame < TAME_COOLDOWN:
         return False, TAME_COOLDOWN - (now - last_tame)
     return True, 0
@@ -336,14 +340,23 @@ def set_tame_owner(owner_id: int):
     cursor.execute("UPDATE user_cooldowns SET last_tame=? WHERE user_id=?", (now, owner_id))
     conn.commit()
 
+# ✅ XP за сообщения
+def can_msg_xp(user_id: int) -> Tuple[bool, int]:
+    now = int(time.time())
+    *_, last_msg_xp = _get_cd(user_id)
+    if now - last_msg_xp < MSG_XP_CD:
+        return False, MSG_XP_CD - (now - last_msg_xp)
+    return True, 0
+
+def set_msg_xp(user_id: int):
+    now = int(time.time())
+    cursor.execute("UPDATE user_cooldowns SET last_msg_xp=? WHERE user_id=?", (now, user_id))
+    conn.commit()
+
 
 # ===================== TAME / RELEASE =====================
 
 def can_retame(owner_id: int, dog_id: int) -> Tuple[bool, int]:
-    """
-    Если пес сбежал, вернуть его может только прошлая хозяйка и через 24ч.
-    Если пес не сбегал (last_escape_ts NULL/0) — ограничение не применяется.
-    """
     cursor.execute("SELECT last_owner_id, COALESCE(last_escape_ts,0) FROM users WHERE user_id=?", (dog_id,))
     row = cursor.fetchone()
     if not row:
@@ -365,10 +378,6 @@ def can_retame(owner_id: int, dog_id: int) -> Tuple[bool, int]:
     return False, RETAME_COOLDOWN - passed
 
 def tame_dog(owner_id: int, dog_id: int) -> bool:
-    """
-    Хозяйка не может иметь больше 1 пса.
-    Пёс должен быть свободен (owner_id IS NULL).
-    """
     owner = get_user(owner_id)
     dog = get_user(dog_id)
     if not owner or not dog:
@@ -392,10 +401,6 @@ def tame_dog(owner_id: int, dog_id: int) -> bool:
     return True
 
 def release_dog(owner_id: int) -> bool:
-    """
-    Отпустить пса: разорвать связь, снять is_tamed.
-    Это НЕ побег.
-    """
     owner = get_user(owner_id)
     if not owner:
         return False
@@ -418,10 +423,6 @@ def release_dog(owner_id: int) -> bool:
 # ===================== ESCAPE FROM OWNER =====================
 
 def escape_from_owner(dog_id: int) -> int:
-    """
-    Побег: если у пса есть owner_id — крадет 20% костей хозяйки,
-    фиксирует побег, и рвёт связь owner<->dog (пёс становится бродячим).
-    """
     dog = get_user(dog_id)
     if not dog:
         return 0
@@ -455,7 +456,7 @@ def escape_from_owner(dog_id: int) -> int:
 
 def can_set_snot_user(user_id: int) -> Tuple[bool, int]:
     now = int(time.time())
-    *_, last_snot, _last_tame = _get_cd(user_id)
+    _, _, _, _, last_snot, _, _ = _get_cd(user_id)
     if now - last_snot < SNOT_COOLDOWN:
         return False, SNOT_COOLDOWN - (now - last_snot)
     return True, 0
@@ -615,52 +616,3 @@ def get_top_owners(limit: int = 10):
         dogname = (dogtitle or "").strip() or (f"{dogtg} пёс" if dogtg else "нет")
         out.append((uid, nm, int(xp), dog_id, dogname))
     return out
-
-
-# ===================== RESET =====================
-
-def reset_user(user_id: int):
-    u = get_user(user_id)
-    if not u:
-        return
-
-    owner_id = u[4]
-    dog_id = u[5]
-
-    if owner_id:
-        cursor.execute("UPDATE users SET dog_id=NULL WHERE user_id=?", (owner_id,))
-    if dog_id:
-        cursor.execute("UPDATE users SET owner_id=NULL WHERE user_id=?", (dog_id,))
-
-    cursor.execute("""
-        UPDATE users SET
-            xp=0,
-            bones=0,
-            owner_id=NULL,
-            dog_id=NULL,
-            gender=NULL,
-            sign=NULL,
-            last_food=0,
-            owner_title=NULL,
-            photo_id=NULL,
-            dog_title=NULL,
-            is_tamed=0,
-            last_owner_id=NULL,
-            last_escape_ts=NULL
-        WHERE user_id=?
-    """, (user_id,))
-
-    cursor.execute("UPDATE user_stats SET speed=0, fangs=0, bite=0 WHERE user_id=?", (user_id,))
-    cursor.execute("""
-        UPDATE user_cooldowns SET
-            last_menu=0,
-            last_race=0,
-            last_walk=0,
-            last_escape=0,
-            last_snot=0,
-            last_tame=0
-        WHERE user_id=?
-    """, (user_id,))
-
-    cursor.execute("DELETE FROM pending_actions WHERE user_id=?", (user_id,))
-    conn.commit()
