@@ -9,6 +9,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from database import (
     STAT_MAX,
+    can_msg_xp, set_msg_xp,
     get_or_create, get_user,
     add_xp, add_bones, get_bones, spend_bones,
     set_photo, set_owner_title, set_dog_title,
@@ -1308,6 +1309,25 @@ async def messages(message: Message):
                         parse_mode="HTML"
                     )
                     return
+        # ===================== XP ЗА СООБЩЕНИЯ (КД 2 сек) =====================
+    # Не даём XP за команды (начинаются с "/"), чтобы не фармили /menu
+    if message.from_user and (message.text is None or not message.text.strip().startswith("/")):
+        uid = message.from_user.id
+        get_or_create(uid, message.from_user.first_name)
+
+        ok_xp, _rem_xp = can_msg_xp(uid)
+        if ok_xp:
+            if is_girl(uid):
+                dog_id, _dog = owner_has_tamed_dog(uid)
+                if dog_id:
+                    add_xp(dog_id, 1)
+                else:
+                    add_xp(uid, 1)
+            else:
+                add_xp(uid, 1)
+
+            set_msg_xp(uid)
+
 
     # сопливый авто-гав
     if not message.chat or message.chat.type == "private":
